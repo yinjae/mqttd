@@ -6,7 +6,7 @@ import akka.actor._
 import akka.cluster.ClusterEvent._
 import akka.cluster._
 import plantae.citrus.mqtt.actors._
-import plantae.citrus.mqtt.actors.session.{SessionCreateRequest, SessionCreateResponse, SessionExistRequest, SessionExistResponse}
+import plantae.citrus.mqtt.actors.session._
 
 import scala.concurrent.ExecutionContext
 
@@ -19,7 +19,6 @@ case class DirectorySessionResult(actor: ActorRef, isCreated: Boolean) extends D
 class DirectoryProxy extends Actor with ActorLogging {
   implicit val timeout = akka.util.Timeout(2, TimeUnit.SECONDS)
   implicit val ec: ExecutionContext = ExecutionContext.Implicits.global
-
 
   var directoryCluster: Set[ActorSelection] = Set()
   val cluster = Cluster(context.system)
@@ -62,11 +61,6 @@ class DirectoryProxy extends Actor with ActorLogging {
             context.stop(self)
         }
       })) ! request
-
-
-      // SUBSCRIBE REQUEST ==> SUBSCRIBE RESPONSE
-      // UNSUBSCRIBE REQUEST ==> UNSUBSCIRBE RESPONSE
-      // PUBLISH REQUEST ==> PUBLISH RESPONSE
 
   }
 

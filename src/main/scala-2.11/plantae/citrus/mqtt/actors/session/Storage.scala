@@ -1,197 +1,164 @@
 package plantae.citrus.mqtt.actors.session
 
-import java.io._
-import java.text.SimpleDateFormat
-import java.util.{Date, UUID}
-
-import akka.actor.ActorRef
-import com.google.common.base.Throwables
-import org.slf4j.LoggerFactory
+import akka.actor.{ActorLogging, ActorRef, FSM}
 import plantae.citrus.mqtt.actors.SystemRoot
 import plantae.citrus.mqtt.packet.{FixedHeader, PublishPacket}
 import scodec.bits.ByteVector
 
-class Storage(sessionName: String) extends Serializable {
-  private val log = LoggerFactory.getLogger(getClass() + sessionName)
+
+case object InvokePublish
+
+case class StorageRequest(publishPacket: PublishPacket)
+
+sealed trait SessionStorageState
+
+
+case object NoneMessage extends SessionStorageState
+
+case object HasRedoMessage extends SessionStorageState
+
+case object HasReadyMessage extends SessionStorageState
+
+sealed trait SessionStorageContainer
+
+case class MessageContainer(currentPacketId: Int, readyQueue: List[QueueMessage], redoQueue: List[PublishPacket], workQueue: List[PublishPacket]) extends SessionStorageContainer
+
+case class Enqueue(payload: Array[Byte], qos: Short, retain: Boolean, topic: String)
+
+case class QueueMessage(payload: Array[Byte], qos: Short, retain: Boolean, topic: String)
+
+case class EvictQueue(packetId: Int)
+
+case object ConnectionClosed
+
+class Storage(sessionActor: ActorRef) extends FSM[SessionStorageState, SessionStorageContainer] with ActorLogging {
   private val chunkSize = {
     try {
       if (SystemRoot.config.hasPath("mqtt.broker.session.chunk.size"))
         SystemRoot.config.getInt("mqtt.broker.session.chunk.size")
-      else 200
+      else 20
     } catch {
-      case t: Throwable => 200
+      case t: Throwable => 20
     }
   }
+  startWith(NoneMessage, MessageContainer(1, Nil, Nil, Nil))
 
-  sealed trait Location
+  when(NoneMessage) {
+    case Event(enqueue: Enqueue, container: MessageContainer) =>
+      self ! InvokePublish
+      goto(HasReadyMessage) using MessageContainer(container.currentPacketId, container.readyQueue :+ QueueMessage(enqueue.payload, enqueue.qos, enqueue.retain, enqueue.topic), container.redoQueue, container.workQueue)
 
-  case object OnMemory extends Location
+    case Event(InvokePublish, container: MessageContainer) =>
+      log.info("InvokePublish:NoneMessage")
+      stay() using container
 
-  case class OnDisk(location: String) extends Location
+    case Event(complete: EvictQueue, container: MessageContainer) =>
+      stay using MessageContainer(container.currentPacketId, container.readyQueue, container.redoQueue, container.workQueue.filter(_.packetId match {
+        case Some(x) => x != complete.packetId
+        case None => true
+      }))
 
-  case class ReadyMessage(payload: Array[Byte], qos: Short, retain: Boolean, topic: String)
-
-  case class ChunkMessage(var location: Location, var readyMessages: List[ReadyMessage]) {
-    def serialize = {
-      try {
-        val directory = new File(SystemRoot.config.getString("mqtt.broker.session.storeDir") + "/" + sessionName + "/" + (new SimpleDateFormat("yyyy/MM/dd").format(new Date())))
-        directory.mkdirs()
-        val path: String = directory.getAbsolutePath + "/" + UUID.randomUUID().toString
-        val outputStreamer = new ObjectOutputStream(new FileOutputStream(path))
-        outputStreamer.writeObject(this)
-        outputStreamer.close()
-        location = OnDisk(path)
-        readyMessages = List()
-      } catch {
-        case t: Throwable => location = OnMemory
-          log.error(" Chunk serialize error : {} ", Throwables.getStackTraceAsString(t))
-      }
-    }
-
-    def deserialize = {
-      location match {
-        case OnMemory =>
-        case OnDisk(path) =>
-          try {
-            val inputStreamer = new ObjectInputStream(new FileInputStream(path))
-            readyMessages = inputStreamer.readObject().asInstanceOf[ChunkMessage].readyMessages
-            location = OnMemory
-            new File(path).delete()
-            inputStreamer.close()
-          } catch {
-            case t: Throwable => location = OnMemory
-              log.error(" Chunk deserialize error : {} ", Throwables.getStackTraceAsString(t))
-          }
+    case Event(ConnectionClosed, container: MessageContainer) =>
+      container.redoQueue ++ container.workQueue match {
+        case Nil => stay using MessageContainer(container.currentPacketId, container.readyQueue, Nil, Nil)
+        case redoQueue: List[PublishPacket] => goto(HasRedoMessage) using MessageContainer(container.currentPacketId, container.readyQueue, redoQueue, Nil)
       }
 
-    }
+  }
 
-    def clear = {
-      location match {
-        case OnMemory => readyMessages = List()
-        case OnDisk(path) => new File(path).delete()
+  def nextPacketId(currentPacketId: Int): Int = {
+    if (currentPacketId + 1 >= Short.MaxValue) 1
+    else currentPacketId + 1
+  }
+
+  when(HasReadyMessage) {
+    case Event(enqueue: Enqueue, container: MessageContainer) =>
+
+      stay using MessageContainer(container.currentPacketId, container.readyQueue :+ QueueMessage(enqueue.payload, enqueue.qos, enqueue.retain, enqueue.topic), container.redoQueue, container.workQueue)
+
+    case Event(InvokePublish, container: MessageContainer) =>
+      if (container.workQueue.size >= chunkSize) {
+        //        log.info("InvokePublish:HasReadyMessage {} {}", container.workQueue.size, container.readyQueue.size)
+        stay using container
+      } else {
+        val message = container.readyQueue.head
+        val publishPacket = PublishPacket(FixedHeader(dup = false, qos = message.qos, retain = message.retain),
+          topic = message.topic,
+          packetId = {
+            if (message.qos == 0) None else Some(container.currentPacketId)
+          },
+          ByteVector(message.payload)
+        )
+
+        sessionActor ! StorageRequest(publishPacket)
+
+        def workQueue = publishPacket.fixedHeader.qos match {
+          case 0 => container.workQueue
+          case x if (x > 0) => container.workQueue :+ publishPacket
+        }
+        container.readyQueue.tail match {
+          case Nil => goto(NoneMessage) using MessageContainer(nextPacketId(container.currentPacketId), Nil, container.redoQueue, workQueue)
+          case tail => stay using MessageContainer(nextPacketId(container.currentPacketId), tail, container.redoQueue, workQueue)
+        }
       }
-    }
+
+    case Event(complete: EvictQueue, container: MessageContainer) =>
+      stay using MessageContainer(container.currentPacketId, container.readyQueue, container.redoQueue, container.workQueue.filter(_.packetId match {
+        case Some(x) => x != complete.packetId
+        case None => true
+      }))
+
+    case Event(ConnectionClosed, container: MessageContainer) =>
+      container.redoQueue ++ container.workQueue match {
+        case Nil => stay using MessageContainer(container.currentPacketId, container.readyQueue, Nil, Nil)
+        case redoQueue: List[PublishPacket] => goto(HasRedoMessage) using MessageContainer(container.currentPacketId, container.readyQueue, redoQueue, Nil)
+      }
   }
 
 
-  private var packetIdGenerator: Int = 0
-  private var topics: List[String] = List()
-  private var readyQueue: List[ChunkMessage] = List()
-  private var workQueue: List[PublishPacket] = List()
-  private var redoQueue: List[PublishPacket] = List()
+  when(HasRedoMessage) {
+    case Event(enqueue: Enqueue, container: MessageContainer) =>
+      stay using MessageContainer(container.currentPacketId, container.readyQueue :+ QueueMessage(enqueue.payload, enqueue.qos, enqueue.retain, enqueue.topic), container.redoQueue, container.workQueue)
 
-  def persist(payload: Array[Byte], qos: Short, retain: Boolean, topic: String) = {
-    readyQueue match {
-      case head :: rest => {
-        if (readyQueue.last.readyMessages.size >= chunkSize) {
-          if (readyQueue.last != readyQueue.head) {
-            readyQueue.last.serialize
-          }
-          readyQueue = readyQueue :+ ChunkMessage(OnMemory, List(ReadyMessage(payload, qos, retain, topic)))
-        } else
-          readyQueue.last.readyMessages = (readyQueue.last.readyMessages :+ ReadyMessage(payload, qos, retain, topic))
-      }
-      case List() => readyQueue = readyQueue :+ ChunkMessage(OnMemory, List(ReadyMessage(payload, qos, retain, topic)))
-    }
-  }
+    case Event(InvokePublish, container: MessageContainer) =>
+      if (container.workQueue.size >= chunkSize) {
+        stay using container
+      } else {
+        val publishPacket = container.redoQueue.head
 
+        sessionActor ! StorageRequest(publishPacket)
 
-  def complete(packetId: Option[Int]) =
-    packetId match {
-      case Some(y) => workQueue = workQueue.filterNot(_.packetId match {
-        case Some(x) => x == y
-        case None => false
-      })
-      case None =>
-    }
+        def workQueue = publishPacket.fixedHeader.qos match {
+          case 0 => container.workQueue
+          case x if (x > 0) => container.workQueue :+ publishPacket
+        }
+        container.redoQueue.tail match {
+          case Nil =>
 
-  def popFirstMessage: Option[ReadyMessage] = {
-    readyQueue match {
-      case headChunk :: tailChunk =>
-        headChunk.deserialize
-        headChunk.readyMessages match {
-          case headMessage :: tailMessage =>
-            headChunk.readyMessages = tailMessage
-            Some(headMessage)
-          case List() =>
-            readyQueue = tailChunk
-            popFirstMessage
+            container.readyQueue match {
+              case Nil => goto(NoneMessage) using MessageContainer(container.currentPacketId, Nil, Nil, workQueue)
+              case readyQueue => goto(HasReadyMessage) using MessageContainer(container.currentPacketId, readyQueue, Nil, workQueue)
+            }
+          case tail: List[PublishPacket] => stay using MessageContainer(container.currentPacketId, container.readyQueue, tail, workQueue)
         }
 
-      case List() => None
-    }
-  }
-
-  def nextMessage: Option[PublishPacket] = {
-    if (workQueue.size > 10) {
-      None
-    } else {
-      redoQueue match {
-        case head :: tail =>
-          redoQueue = tail
-          workQueue = workQueue :+ head
-          Some(PublishPacket(FixedHeader(true, head.fixedHeader.qos, head.fixedHeader.retain), head.topic, head.packetId, head.payload))
-        case Nil =>
-          popFirstMessage match {
-            case Some(message) =>
-              val publish = message.qos match {
-                case x if (x > 0) =>
-                  val publishPacket = PublishPacket(FixedHeader(dup = false, qos = message.qos, retain = message.retain),
-                    topic = message.topic,
-                    packetId = Some(nextPacketId),
-                    ByteVector(message.payload)
-                  )
-                  workQueue = workQueue :+ publishPacket
-                  publishPacket
-
-                case x if (x == 0) =>
-                  PublishPacket(FixedHeader(dup = false, qos = message.qos, retain = message.retain),
-                    topic = message.topic,
-                    packetId = Some(nextPacketId),
-                    ByteVector(message.payload)
-                  )
-              }
-
-              Some(publish)
-            case None => None
-          }
       }
 
-    }
+    case Event(complete: EvictQueue, container: MessageContainer) =>
+      stay using MessageContainer(container.currentPacketId, container.readyQueue, container.redoQueue, container.workQueue.filter(_.packetId match {
+        case Some(x) => x != complete.packetId
+        case None => true
+      }))
+
+    case Event(ConnectionClosed, container: MessageContainer) =>
+      stay using MessageContainer(container.currentPacketId, container.readyQueue, container.redoQueue ++ container.workQueue, Nil)
   }
 
-  def socketClose = {
-    redoQueue = redoQueue ++ workQueue
-    workQueue = Nil
+
+  @throws[Exception](classOf[Exception])
+  override def postStop(): Unit = {
+    super.postStop()
   }
 
-  def clear = {
-    topics = List()
-    readyQueue.foreach(chunk => chunk.clear)
-    readyQueue = List()
-    workQueue = List()
-  }
-
-  private def nextPacketId: Int = {
-    packetIdGenerator = {
-      if ((packetIdGenerator + 1) >= Short.MaxValue)
-        1
-      else (packetIdGenerator + 1)
-    }
-    packetIdGenerator
-  }
-
-  def messageSize = {
-    readyQueue.foldLeft(0)((a, b) => a + (b.location match {
-      case OnMemory => b.readyMessages.size
-      case x: OnDisk => chunkSize
-    }))
-  }
-}
-
-object Storage {
-  def apply(sessionName: String) = new Storage(sessionName)
-
-  def apply(session: ActorRef) = new Storage(session.path.name)
+  initialize()
 }

@@ -7,11 +7,10 @@ import plantae.citrus.mqtt.actors.session.SessionRoot
 import plantae.citrus.mqtt.actors.topic.TopicManager
 
 /**
+
  * Created by yinjae on 15. 4. 21..
  */
 object SystemRoot {
-
-
   val config = ConfigFactory.load()
   val system = ActorSystem("mqtt", config.getConfig("mqtt"))
   val sessionRoot = system.actorOf(Props[SessionRoot], "session")

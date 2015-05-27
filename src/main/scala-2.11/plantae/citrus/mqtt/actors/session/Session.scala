@@ -32,13 +32,6 @@ case class PublishMessage(topicName: String, qos: Short, payload: ByteVector)
 
 class SessionRoot extends Actor with ActorLogging {
   override def receive = {
-    case clientId: String => {
-      context.child(clientId) match {
-        case Some(x) => sender ! x
-        case None => log.debug("new session is created [{}]", clientId)
-          sender ! context.actorOf(Props[Session], clientId)
-      }
-    }
 
     case SessionCreateRequest(clientId: String) => {
       context.child(clientId) match {
@@ -58,7 +51,7 @@ class Session extends Actor with ActorLogging {
   implicit val timeout = akka.util.Timeout(5, TimeUnit.SECONDS)
 
   private var connectionStatus: Option[ConnectionStatus] = None
-  private val storage = Storage(self)
+  private val storage = context.actorOf(Props(classOf[Storage], self))
 
   override def postStop = {
     log.info("shut down session {}", self)
@@ -67,30 +60,39 @@ class Session extends Actor with ActorLogging {
         connectionStatus = None
       case None =>
     }
-    storage.clear
+  }
+
+  def handleStorage(request: StorageRequest) = {
+    request.publishPacket.packetId match {
+      case Some(x) => context.actorOf(Props(classOf[OutboundPublisher], connectionStatus.get.socket, self), outboundActorName(x.toString)) ! request.publishPacket
+      case None => context.actorOf(Props(classOf[OutboundPublisher], connectionStatus.get.socket, self), outboundActorName(UUID.randomUUID().toString.replace("/", ""))) ! request.publishPacket
+    }
   }
 
   override def receive: Receive = {
     case MQTTInboundPacket(packet) => handleMQTTPacket(packet, sender)
     case sessionRequest: SessionRequest => handleSession(sessionRequest)
+    case storageRequest: StorageRequest => handleStorage(storageRequest)
     case publish: PublishMessage => handleTopicPacket(publish)
     case x: Outbound => handleOutboundPublish(x)
     case everythingElse => log.error("unexpected message : {}", everythingElse)
   }
 
-  def handleOutboundPublish(x: Outbound) = {
-    x match {
+  def handleOutboundPublish(outbound: Outbound) = {
+    outbound match {
       case publishDone: OutboundPublishDone =>
-        storage.complete(publishDone.packetId)
-        invokePublish
+        publishDone.packetId match {
+          case Some(x) => storage ! EvictQueue(x)
+          case None =>
+        }
+        storage ! InvokePublish
       case anyOtherCase => unhandled(anyOtherCase)
     }
   }
 
   def handleTopicPacket(response: PublishMessage) {
-
-    storage.persist(response.payload.toArray, response.qos, false, response.topicName)
-    invokePublish
+    storage ! Enqueue(response.payload.toArray, response.qos, false, response.topicName)
+    storage ! InvokePublish
   }
 
 
@@ -106,7 +108,7 @@ class Session extends Actor with ActorLogging {
       }
 
       connectionStatus = None
-      storage.socketClose
+      storage ! ConnectionClosed
 
       context.children.foreach(child => {
         if (child.path.name.startsWith(PublishConstant.inboundPrefix) || child.path.name.startsWith(PublishConstant.outboundPrefix))
@@ -118,7 +120,8 @@ class Session extends Actor with ActorLogging {
       log.debug("ClientCloseConnection : " + self.path.name)
       val currentConnectionStatus = connectionStatus
       connectionStatus = None
-      storage.socketClose
+      storage ! ConnectionClosed
+
       context.children.foreach(child => {
         if (child.path.name.startsWith(PublishConstant.inboundPrefix) || child.path.name.startsWith(PublishConstant.outboundPrefix))
           context.stop(child)
@@ -162,7 +165,7 @@ class Session extends Actor with ActorLogging {
         connectionStatus = Some(ConnectionStatus(mqttWill, mqtt.variableHeader.keepAliveTime, self, context, sender))
         bridge ! MQTTOutboundPacket(ConnAckPacket(sessionPresentFlag = true, returnCode = ReturnCode.connectionAccepted))
         log.info("new connection establish : [{}]", self.path.name)
-        invokePublish
+        storage ! InvokePublish
 
       case p: PingReqPacket =>
         bridge ! MQTTOutboundPacket(p)
@@ -216,7 +219,7 @@ class Session extends Actor with ActorLogging {
           case Some(x) => x.destroyProperly
           case None =>
         }
-        storage.socketClose
+        storage ! ConnectionClosed
         context.children.foreach(child => {
           if (child.path.name.startsWith(PublishConstant.inboundPrefix) || child.path.name.startsWith(PublishConstant.outboundPrefix))
             context.stop(child)
@@ -242,48 +245,6 @@ class Session extends Actor with ActorLogging {
     val session = self
 
     context.actorOf(SubscribeTopic.props(subscribe.topicFilter, session, connectionStatus, subscribe))
-  }
-
-  //  def unsubscribeTopics(topics: List[String]) = {
-  //    val session = self
-  //    topics.foreach(x => {
-  //      SystemRoot.directoryProxy.tell(DirectoryTopicRequest(x), context.actorOf(Props(new Actor {
-  //        def receive = {
-  //          case DirectoryTopicResult(name, topicActors) =>
-  //            topicActors.par.foreach(actor => actor ! Unsubscribe(session))
-  //          //          topicActor != UNSUBSCRIBE
-  //        }
-  //      })))
-  //
-  //    }
-  //    )
-  //  }
-
-  def invokePublish = {
-    val session = self
-    connectionStatus match {
-      case Some(client) =>
-        storage.nextMessage match {
-          case Some(x) =>
-            val actorName = PublishConstant.outboundPrefix + (x.packetId match {
-              case Some(y) => y
-              case None => UUID.randomUUID().toString
-            })
-
-            context.child(actorName) match {
-              case Some(actor) =>
-                log.debug("using exist actor publish  complete {} ", actorName)
-                actor ! x
-
-              case None =>
-                log.debug("create new actor publish  complete {} ", actorName)
-                context.actorOf(Props(classOf[OutboundPublisher], client.socket, session), actorName) ! x
-            }
-
-          case None => log.debug("invoke publish but no message : child actor count - {} ", context.children.foldLeft(List[String]())((x, ac) => x :+ ac.path.name))
-        }
-      case None => log.debug("invoke publish but no connection : child actor count - {}", context.children.foldLeft(List[String]())((x, ac) => x :+ ac.path.name))
-    }
   }
 
 }

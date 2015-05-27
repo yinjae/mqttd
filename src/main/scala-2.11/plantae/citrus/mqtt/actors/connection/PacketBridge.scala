@@ -25,17 +25,17 @@ sealed trait BridgeData
 
 case class Session(actor: ActorRef, isCreated: Boolean)
 
-case class SessionCreateContainer(bridge: ActorRef, toSend: ControlPacket) extends BridgeData
+case class SearchSessionContainer(bridge: ActorRef, toSend: ControlPacket) extends BridgeData
 
 case class BridgeContainer(session: ActorRef, bridge: ActorRef, isCreated: Boolean) extends BridgeData
 
 case class RestByteContainer(session: ActorRef, bridge: ActorRef, remainingBytes: BitVector) extends BridgeData
 
 class PacketBridge(socket: ActorRef) extends FSM[BridgeState, BridgeData] with ActorLogging {
-  startWith(ConnectionWaitConnect, SessionCreateContainer(self, null))
+  startWith(ConnectionWaitConnect, SearchSessionContainer(self, null))
 
   when(ConnectionWaitConnect) {
-    case Event(Received(data), container: SessionCreateContainer) =>
+    case Event(Received(data), container: SearchSessionContainer) =>
       PacketDecoder.decode(BitVector(data)) match {
         case ((head: ConnectPacket) :: Nil, _) =>
           SystemRoot.directoryProxy.tell(DirectorySessionRequest(head.clientId),
@@ -47,8 +47,8 @@ class PacketBridge(socket: ActorRef) extends FSM[BridgeState, BridgeData] with A
                     context.stop(session)
                     context.become({
                       case Terminated(x) =>
-                        SystemRoot.sessionRoot ! session.path.name
-                      case newSession: ActorRef =>
+                        SystemRoot.sessionRoot ! SessionCreateRequest(session.path.name)
+                      case SessionCreateResponse(clientId, newSession) =>
                         container.bridge ! Session(newSession, true)
                         context.stop(self)
                     })
@@ -61,14 +61,15 @@ class PacketBridge(socket: ActorRef) extends FSM[BridgeState, BridgeData] with A
             })
             )
           )
-          goto(ConnectionGetSession) using SessionCreateContainer(container.bridge, head)
+          goto(ConnectionGetSession) using SearchSessionContainer(container.bridge, head)
         case _ => stop(FSM.Shutdown)
       }
   }
 
   when(ConnectionGetSession) {
-    case Event(session: Session, container: SessionCreateContainer) =>
+    case Event(session: Session, container: SearchSessionContainer) =>
       session.actor ! MQTTInboundPacket(container.toSend)
+      context.watch(session.actor)
       goto(ConnectionForwardConnAct) using BridgeContainer(session.actor, container.bridge, session.isCreated)
   }
 
@@ -77,16 +78,17 @@ class PacketBridge(socket: ActorRef) extends FSM[BridgeState, BridgeData] with A
     case Event(MQTTOutboundPacket(connAck: ConnAckPacket), container: BridgeContainer) =>
       socket ! Write(ByteString(Codec[ControlPacket].encode(ConnAckPacket(connAck.fixedHeader, container.isCreated, connAck.returnCode)).require.toByteBuffer))
       goto(ConnectionEstablished) using new RestByteContainer(container.session, container.bridge, BitVector.empty)
+    case Event(terminated: Terminated, _) =>
+      log.warning("session({}) is terminated ", terminated.getActor.path);
+      stop(FSM.Shutdown)
   }
 
   when(ConnectionEstablished) {
     case Event(MQTTOutboundPacket(packet: ControlPacket), container: RestByteContainer) =>
-      log.debug("PACKETBRIDGE] {}", packet)
       socket ! Write(ByteString(Codec[ControlPacket].encode(packet).require.toByteBuffer))
       stay using container
 
     case Event(disconnect: DisconnectPacket, container: RestByteContainer) =>
-      log.debug("PACKETBRIDGE] {}", disconnect)
       container.session ! MQTTInboundPacket(DisconnectPacket())
       stop(FSM.Shutdown)
 
@@ -101,6 +103,10 @@ class PacketBridge(socket: ActorRef) extends FSM[BridgeState, BridgeData] with A
 
     case Event(PeerClosed, container: RestByteContainer) =>
       container.session ! ClientCloseConnection
+      stop(FSM.Shutdown)
+
+    case Event(terminated: Terminated, _) =>
+      log.warning("session({}) is terminated ", terminated.getActor.path);
       stop(FSM.Shutdown)
   }
 

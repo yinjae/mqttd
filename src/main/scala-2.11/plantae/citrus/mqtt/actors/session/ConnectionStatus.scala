@@ -25,7 +25,6 @@ case class ConnectionStatus(will: Option[Will], keepAliveTime: Int, session: Act
       case Some(x) => x.cancel()
       case None =>
     }
-
   }
 
   def resetTimer = {
@@ -38,8 +37,8 @@ case class ConnectionStatus(will: Option[Will], keepAliveTime: Int, session: Act
   private def publishWill = {
     will match {
       case Some(x) =>
-      // TODO : will qos
-        SystemRoot.topicManager! Publish(x.topic, x.message, x.retain, None)
+        // TODO : will qos
+        SystemRoot.topicManager ! Publish(x.topic, x.message, x.retain, None)
       case None =>
     }
   }
@@ -54,6 +53,4 @@ case class ConnectionStatus(will: Option[Will], keepAliveTime: Int, session: Act
     publishWill
     cancelTimer
   }
-
-
 }

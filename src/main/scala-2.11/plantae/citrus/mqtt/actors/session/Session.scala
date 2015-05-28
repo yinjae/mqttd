@@ -91,7 +91,7 @@ class Session extends Actor with ActorLogging {
   }
 
   def handleTopicPacket(response: PublishMessage) {
-    storage ! Enqueue(response.payload.toArray, response.qos, false, response.topicName)
+    storage ! Enqueue(response.payload, response.qos, false, response.topicName)
     storage ! InvokePublish
   }
 

@@ -1,6 +1,6 @@
 package plantae.citrus.mqtt.actors.session
 
-import akka.actor.{ActorLogging, ActorRef, FSM}
+import akka.actor.{ActorLogging, ActorRef, FSM, Terminated}
 import plantae.citrus.mqtt.actors.SystemRoot
 import plantae.citrus.mqtt.packet.{FixedHeader, PublishPacket}
 import scodec.bits.ByteVector
@@ -23,15 +23,15 @@ sealed trait SessionStorageContainer
 
 case class MessageContainer(currentPacketId: Int, readyQueue: List[QueueMessage], redoQueue: List[PublishPacket], workQueue: List[PublishPacket]) extends SessionStorageContainer
 
-case class Enqueue(payload: Array[Byte], qos: Short, retain: Boolean, topic: String)
+case class Enqueue(payload: ByteVector, qos: Short, retain: Boolean, topic: String)
 
-case class QueueMessage(payload: Array[Byte], qos: Short, retain: Boolean, topic: String)
+case class QueueMessage(payload: ByteVector, qos: Short, retain: Boolean, topic: String)
 
 case class EvictQueue(packetId: Int)
 
 case object ConnectionClosed
 
-class Storage(sessionActor: ActorRef) extends FSM[SessionStorageState, SessionStorageContainer] with ActorLogging {
+class Storage(session: ActorRef) extends FSM[SessionStorageState, SessionStorageContainer] with ActorLogging {
   private val chunkSize = {
     try {
       if (SystemRoot.config.hasPath("mqtt.broker.session.chunk.size"))
@@ -41,6 +41,7 @@ class Storage(sessionActor: ActorRef) extends FSM[SessionStorageState, SessionSt
       case t: Throwable => 20
     }
   }
+
   startWith(NoneMessage, MessageContainer(1, Nil, Nil, Nil))
 
   when(NoneMessage) {
@@ -49,7 +50,6 @@ class Storage(sessionActor: ActorRef) extends FSM[SessionStorageState, SessionSt
       goto(HasReadyMessage) using MessageContainer(container.currentPacketId, container.readyQueue :+ QueueMessage(enqueue.payload, enqueue.qos, enqueue.retain, enqueue.topic), container.redoQueue, container.workQueue)
 
     case Event(InvokePublish, container: MessageContainer) =>
-      log.info("InvokePublish:NoneMessage")
       stay() using container
 
     case Event(complete: EvictQueue, container: MessageContainer) =>
@@ -63,13 +63,11 @@ class Storage(sessionActor: ActorRef) extends FSM[SessionStorageState, SessionSt
         case Nil => stay using MessageContainer(container.currentPacketId, container.readyQueue, Nil, Nil)
         case redoQueue: List[PublishPacket] => goto(HasRedoMessage) using MessageContainer(container.currentPacketId, container.readyQueue, redoQueue, Nil)
       }
-
+    case Event(terminated: Terminated, container: MessageContainer) =>
+      if (terminated.getActor == session) stop(FSM.Shutdown)
+      else stay using container
   }
 
-  def nextPacketId(currentPacketId: Int): Int = {
-    if (currentPacketId + 1 >= Short.MaxValue) 1
-    else currentPacketId + 1
-  }
 
   when(HasReadyMessage) {
     case Event(enqueue: Enqueue, container: MessageContainer) =>
@@ -78,7 +76,6 @@ class Storage(sessionActor: ActorRef) extends FSM[SessionStorageState, SessionSt
 
     case Event(InvokePublish, container: MessageContainer) =>
       if (container.workQueue.size >= chunkSize) {
-        //        log.info("InvokePublish:HasReadyMessage {} {}", container.workQueue.size, container.readyQueue.size)
         stay using container
       } else {
         val message = container.readyQueue.head
@@ -87,18 +84,24 @@ class Storage(sessionActor: ActorRef) extends FSM[SessionStorageState, SessionSt
           packetId = {
             if (message.qos == 0) None else Some(container.currentPacketId)
           },
-          ByteVector(message.payload)
+          message.payload
         )
 
-        sessionActor ! StorageRequest(publishPacket)
+        session ! StorageRequest(publishPacket)
 
         def workQueue = publishPacket.fixedHeader.qos match {
           case 0 => container.workQueue
           case x if (x > 0) => container.workQueue :+ publishPacket
         }
+
+        def nextPacketId: Int = {
+          if (container.currentPacketId + 1 >= Short.MaxValue) 1
+          else container.currentPacketId + 1
+        }
+
         container.readyQueue.tail match {
-          case Nil => goto(NoneMessage) using MessageContainer(nextPacketId(container.currentPacketId), Nil, container.redoQueue, workQueue)
-          case tail => stay using MessageContainer(nextPacketId(container.currentPacketId), tail, container.redoQueue, workQueue)
+          case Nil => goto(NoneMessage) using MessageContainer(nextPacketId, Nil, container.redoQueue, workQueue)
+          case tail => stay using MessageContainer(nextPacketId, tail, container.redoQueue, workQueue)
         }
       }
 
@@ -113,6 +116,11 @@ class Storage(sessionActor: ActorRef) extends FSM[SessionStorageState, SessionSt
         case Nil => stay using MessageContainer(container.currentPacketId, container.readyQueue, Nil, Nil)
         case redoQueue: List[PublishPacket] => goto(HasRedoMessage) using MessageContainer(container.currentPacketId, container.readyQueue, redoQueue, Nil)
       }
+
+    case Event(terminated: Terminated, container: MessageContainer) =>
+      if (terminated.getActor == session) stop(FSM.Shutdown)
+      else stay using container
+
   }
 
 
@@ -126,7 +134,7 @@ class Storage(sessionActor: ActorRef) extends FSM[SessionStorageState, SessionSt
       } else {
         val publishPacket = container.redoQueue.head
 
-        sessionActor ! StorageRequest(publishPacket)
+        session ! StorageRequest(publishPacket)
 
         def workQueue = publishPacket.fixedHeader.qos match {
           case 0 => container.workQueue
@@ -152,8 +160,18 @@ class Storage(sessionActor: ActorRef) extends FSM[SessionStorageState, SessionSt
 
     case Event(ConnectionClosed, container: MessageContainer) =>
       stay using MessageContainer(container.currentPacketId, container.readyQueue, container.redoQueue ++ container.workQueue, Nil)
+
+    case Event(terminated: Terminated, container: MessageContainer) =>
+      if (terminated.getActor == session) stop(FSM.Shutdown)
+      else stay using container
   }
 
+
+  @throws[Exception](classOf[Exception])
+  override def preStart(): Unit = {
+    super.preStart()
+    context.watch(session)
+  }
 
   @throws[Exception](classOf[Exception])
   override def postStop(): Unit = {
